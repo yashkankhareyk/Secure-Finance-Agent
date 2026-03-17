@@ -1,0 +1,77 @@
+# Compliance Rules Configuration
+# Modify these rules to match your regulatory requirements
+
+disclaimers:
+  investment_advice:
+    trigger_words:
+      - recommend
+      - suggest
+      - should buy
+      - should sell
+      - best stock
+      - guaranteed
+      - sure thing
+      - "can't lose"
+      - hot tip
+      - insider
+    required_disclaimer: >
+      This is for informational purposes only and does not constitute
+      investment advice. Past performance does not guarantee future results.
+      Please consult with a qualified financial advisor.
+    severity: high
+
+  tax_advice:
+    trigger_words:
+      - tax deduction
+      - tax benefit
+      - write off
+      - tax shelter
+      - tax strategy
+      - avoid taxes
+      - reduce taxes
+    required_disclaimer: >
+      Tax situations vary by individual. This is general information
+      and not tax advice. Please consult a qualified tax professional.
+    severity: high
+
+  insurance_advice:
+    trigger_words:
+      - insurance policy
+      - coverage recommendation
+      - best insurance
+      - insurance plan
+    required_disclaimer: >
+      Insurance needs vary by individual. Consult a licensed insurance
+      professional for specific recommendations.
+    severity: medium
+
+prohibited_claims:
+  - guaranteed returns
+  - risk-free investment
+  - "can't lose money"
+  - 100% safe
+  - no risk
+  - sure profit
+  - insider information
+  - secret strategy
+  - double your money guaranteed
+  - zero risk
+
+suitability_requirements:
+  must_consider:
+    - risk tolerance
+    - investment timeline
+    - financial goals
+    - current financial situation
+    - diversification
+  must_not_assume:
+    - specific income level
+    - tax bracket
+    - risk tolerance without asking
+    - investment experience
+
+regulatory_references:
+  SEC: Securities and Exchange Commission
+  FINRA: Financial Industry Regulatory Authority
+  Reg_BI: Regulation Best Interest
+  fiduciary_duty: Act in client's best interest

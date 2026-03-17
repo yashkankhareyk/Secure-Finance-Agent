@@ -1,0 +1,51 @@
+# ==============================================
+# Secure Financial Advisory Agent - Dependencies
+# ==============================================
+
+# --- Core Framework ---
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-dotenv==1.1.0
+pydantic==2.10.3
+
+# --- LLM & Agent Framework ---
+langgraph==0.2.60
+langchain==0.3.13
+langchain-core>=0.3.29,<0.4.0
+langchain-openai==0.2.14
+langchain-groq==0.2.3
+
+# --- Vector Store & Embeddings (NEW correct packages) ---
+# These are the official LangChain integration packages
+# They replace the deprecated langchain_community imports
+langchain-huggingface==0.1.2
+langchain-chroma==0.2.2
+chromadb==0.5.23
+sentence-transformers==3.3.1
+
+# --- LangChain Community (only for non-deprecated utilities) ---
+langchain-community==0.3.13
+
+# --- Financial Data (all FREE) ---
+yfinance==0.2.51
+
+# --- Privacy & Security ---
+presidio-analyzer==2.2.355
+presidio-anonymizer==2.2.355
+
+# --- Document Processing ---
+pypdf==5.1.0
+python-multipart==0.0.18
+
+# --- Database (works with SQLite dev + PostgreSQL/Supabase prod) ---
+SQLAlchemy>=2.0.0
+psycopg2-binary>=2.9.6
+
+# --- Utilities ---
+pyyaml==6.0.2
+httpx==0.28.1
+numpy==1.26.4
+
+# --- Testing ---
+pytest==8.3.4
+pytest-asyncio==0.24.0
