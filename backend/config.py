@@ -1,6 +1,10 @@
 """
 Configuration management for the Secure Financial Advisory Agent.
 Loads settings from environment variables with sensible defaults.
+
+CHANGED: validate_database_url() and ensure_directories() are NO longer
+called at import time. They are called explicitly in main.py lifespan()
+so that importing config never raises or does filesystem work.
 """
 
 import os
@@ -21,21 +25,21 @@ class Settings:
     CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", str(DATA_DIR / "chroma_db"))
 
     # --- Database (Neon Serverless PostgreSQL) ---
-    # Format: postgresql://user:pass@ep-xxx.region.aws.neon.tech/dbname?sslmode=require
     DATABASE_URL = os.getenv("DATABASE_URL", "")
 
     @property
     def is_postgres(self) -> bool:
-        """Always True — Neon is PostgreSQL."""
         return True
 
     @property
     def is_neon(self) -> bool:
-        """Check if using Neon serverless."""
         return "neon.tech" in self.DATABASE_URL
 
     def validate_database_url(self):
-        """Ensure DATABASE_URL is set and points to Neon."""
+        """
+        Ensure DATABASE_URL is set and points to PostgreSQL.
+        Call this explicitly at app startup — NOT at import time.
+        """
         if not self.DATABASE_URL:
             raise ValueError(
                 "DATABASE_URL environment variable is required. "
@@ -48,8 +52,19 @@ class Settings:
                 "Got: " + self.DATABASE_URL[:20] + "..."
             )
 
+    @classmethod
+    def ensure_directories(cls):
+        """
+        Create necessary directories if they don't exist.
+        Call this explicitly at app startup — NOT at import time.
+        """
+        cls.DATA_DIR.mkdir(exist_ok=True)
+        cls.FINANCIAL_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        cls.COMPLIANCE_RULES_DIR.mkdir(parents=True, exist_ok=True)
+        Path(cls.CHROMA_PERSIST_DIR).mkdir(parents=True, exist_ok=True)
+
     # --- LLM Provider ---
-    LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq")  # openai, ollama, groq
+    LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq")
     LLM_MODEL = os.getenv("LLM_MODEL", "llama-3.1-8b-instant")
 
     # OpenAI
@@ -61,7 +76,7 @@ class Settings:
     # Groq (free tier)
     GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
-    # OpenRouter (alternative hosted provider)
+    # OpenRouter
     OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
     OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://api.openrouter.ai")
 
@@ -76,14 +91,6 @@ class Settings:
 
     # --- CORS ---
     FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
-
-    @classmethod
-    def ensure_directories(cls):
-        """Create necessary directories if they don't exist."""
-        cls.DATA_DIR.mkdir(exist_ok=True)
-        cls.FINANCIAL_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-        cls.COMPLIANCE_RULES_DIR.mkdir(parents=True, exist_ok=True)
-        Path(cls.CHROMA_PERSIST_DIR).mkdir(parents=True, exist_ok=True)
 
     @classmethod
     def get_llm_config(cls) -> dict:
@@ -117,6 +124,7 @@ class Settings:
             raise ValueError(f"Unknown LLM provider: {cls.LLM_PROVIDER}")
 
 
+# -- Single shared instance --
+# NOTE: validate_database_url() and ensure_directories() are intentionally
+# NOT called here. main.py lifespan() calls them at startup.
 settings = Settings()
-settings.validate_database_url()
-settings.ensure_directories()

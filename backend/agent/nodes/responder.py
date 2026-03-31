@@ -1,6 +1,7 @@
 """
-Responder Node - Generates the final response using the LLM.
-Combines tool results with the conversation context.
+Fix 3 — Updated Responder
+Replaces: backend/agent/nodes/responder.py
+Uses all_tool_results so the LLM sees context from every tool called this turn.
 """
 
 import logging
@@ -24,59 +25,56 @@ IMPORTANT RULES:
 9. Protect user privacy - never ask for or store personal financial details.
 10. Format responses clearly with headings, bullet points, and tables when appropriate.
 
-When tool results are provided, integrate them naturally into your response.
-When no tool results are available, use your general financial knowledge.
-
+When multiple tool results are provided, synthesize them into a coherent, unified answer.
 Always be professional, educational, and helpful."""
 
 
 def generate_response(state: AgentState) -> AgentState:
-    """Generate the final response using the LLM."""
+    """Generate the final response using the LLM with all accumulated tool results."""
     from agent.graph import get_llm
 
     llm = get_llm()
     query = state.get("current_query", "")
-    tool_results = state.get("tool_results", {})
     messages = list(state.get("messages", []))
 
-    # Build the context message
+    # ── Build context from ALL tool results (Fix 3) ───────────────────────────
+    all_results: list[dict] = state.get("all_tool_results") or []
+
+    # Backward compat: if all_tool_results is empty, fall back to tool_results
+    if not all_results:
+        tr = state.get("tool_results", {})
+        if tr and tr.get("result"):
+            all_results = [tr]
+
     context_parts = [f"User Query: {query}"]
 
-    if tool_results and tool_results.get("result"):
-        route = tool_results.get("route", "unknown")
-        result = tool_results["result"]
-        context_parts.append(f"\nTool Used: {route}")
-        context_parts.append(f"\nTool Results:\n{result}")
+    if all_results:
+        context_parts.append("\nTool Results:")
+        for item in all_results:
+            route_label = item.get("route", "unknown").upper()
+            result_text = item.get("result", "")
+            context_parts.append(f"\n[{route_label}]\n{result_text}")
+    # ─────────────────────────────────────────────────────────────────────────
 
     context = "\n".join(context_parts)
 
-    # Build message list for LLM
-    llm_messages = [
-        SystemMessage(content=SYSTEM_PROMPT),
-    ]
+    llm_messages = [SystemMessage(content=SYSTEM_PROMPT)]
 
-    # Add conversation history (last 10 messages for context window management)
+    # Conversation history (last 10 turns)
     history = messages[-10:] if len(messages) > 10 else messages
-
-    # Add the current turn
-    llm_messages.append(
-        HumanMessage(content=context)
-    )
+    llm_messages.extend(history)
+    llm_messages.append(HumanMessage(content=context))
 
     try:
         response = llm.invoke(llm_messages)
         response_text = response.content
-
     except Exception as e:
         logger.error(f"LLM response generation error: {e}")
         response_text = (
             "I apologize, but I'm having trouble generating a response right now. "
-            "Please try again in a moment. If you have specific financial questions, "
-            "I'm here to help with investment information, market data, calculations, "
-            "and compliance guidance."
+            "Please try again in a moment."
         )
 
-    # Add the response to messages
     new_messages = messages + [
         HumanMessage(content=query),
         AIMessage(content=response_text),

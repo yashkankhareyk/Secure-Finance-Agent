@@ -1,10 +1,15 @@
 """
-RAG Tool - Searches financial knowledge base for relevant information.
+Fix 4 + 5 — Updated rag_tool.py
+Replaces: backend/agent/tools/rag_tool.py
+
+Changes vs original:
+  • Uses financial_retriever.search() (hybrid) instead of simple similarity_search
+  • Passes results through reranker before building context
+  • Adds source citations and metadata to the tool output so the LLM can cite them
 """
 
 import logging
-from langchain_core.tools import tool
-from rag.retriever import financial_retriever
+from langchain.tools import tool
 
 logger = logging.getLogger(__name__)
 
@@ -12,38 +17,43 @@ logger = logging.getLogger(__name__)
 @tool
 def search_financial_knowledge(query: str) -> str:
     """
-    Search the financial knowledge base for information about
-    investment strategies, retirement planning, risk management,
-    tax strategies, and compliance regulations.
-
-    Use this tool when the user asks about:
-    - Investment strategies or asset allocation
-    - Retirement planning (401k, IRA, etc.)
-    - Risk metrics (beta, sharpe ratio, etc.)
-    - Tax-efficient investing
-    - Financial regulations and compliance
-    - General financial education topics
-
-    Args:
-        query: The search query about financial topics
+    Search the financial knowledge base using hybrid retrieval + re-ranking.
+    Returns relevant financial information with source citations.
     """
-    try:
-        results = financial_retriever.search(query, k=3)
+    from rag.retriever import financial_retriever
+    from rag.reranker import reranker
 
-        if not results:
-            return "No relevant information found in the knowledge base. I'll provide general guidance based on my training."
+    # Step 1: Hybrid retrieval — fetch more candidates than we need
+    candidates = financial_retriever.search(query, k=10)
 
-        # Format results
-        formatted = []
-        for i, r in enumerate(results, 1):
-            source = r["metadata"].get("topic", "general")
-            score = r["relevance_score"]
-            formatted.append(
-                f"**Source {i}** (topic: {source}, relevance: {score}):\n{r['content']}"
-            )
+    if not candidates:
+        return (
+            "No relevant information found in the knowledge base. "
+            "I'll answer based on general financial knowledge."
+        )
 
-        return "\n\n---\n\n".join(formatted)
+    # Step 2: Re-rank with cross-encoder for precision
+    top_docs = reranker.rerank(query, candidates, top_n=4)
 
-    except Exception as e:
-        logger.error(f"RAG search error: {e}")
-        return f"Knowledge base search encountered an error. Please try rephrasing your question."
+    # Step 3: Format results with source metadata for the LLM
+    context_parts = []
+    for i, doc in enumerate(top_docs, 1):
+        source = doc.get("source", "knowledge base")
+        topic = doc.get("topic", "")
+        section = doc.get("section", "")
+        score = doc.get("rerank_score") or doc.get("relevance_score", 0)
+
+        header_parts = [f"[{i}]"]
+        if topic:
+            header_parts.append(f"Topic: {topic}")
+        if source and source != "seed_data":
+            header_parts.append(f"Source: {source}")
+        if section:
+            header_parts.append(f"Section: {section[:60]}")
+        header_parts.append(f"Relevance: {score:.2f}")
+
+        context_parts.append(" | ".join(header_parts))
+        context_parts.append(doc["content"])
+        context_parts.append("")  # blank line between chunks
+
+    return "\n".join(context_parts)

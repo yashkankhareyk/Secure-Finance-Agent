@@ -1,6 +1,13 @@
 """
 FastAPI Backend - Main application entry point.
 Handles HTTP endpoints, security middleware, and agent orchestration.
+
+CHANGED:
+- settings.validate_database_url() and settings.ensure_directories()
+  moved here into lifespan() so imports never raise.
+- initialize_agent() called in lifespan() for eager graph startup.
+- Rate limiter is now proxy-aware (honors X-Forwarded-For).
+- Rate limiter uses a cleanup strategy safe for long-running processes.
 """
 
 import time
@@ -15,7 +22,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from config import settings
-from agent.graph import run_agent
+from agent.graph import run_agent, initialize_agent
 from privacy.pii_detector import pii_detector
 from privacy.prompt_guard import prompt_guard
 from privacy.output_sanitizer import output_sanitizer
@@ -30,19 +37,91 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Rate limiting store (in-memory, simple)
+# ---------------------------------------------------------------------------
+# Rate limiting store (in-memory, single-process)
+# NOTE: For multi-worker/multi-container deployments replace with Redis.
+#       e.g. pip install redis and use a shared Redis key per IP.
+# ---------------------------------------------------------------------------
 _rate_limit_store: dict[str, list[float]] = {}
+_rate_limit_last_cleanup: float = time.time()
+_RATE_LIMIT_CLEANUP_INTERVAL = 300  # clean up stale IPs every 5 minutes
 
+
+def _get_client_ip(req: Request) -> str:
+    """
+    Return the real client IP, honoring reverse-proxy headers.
+    X-Forwarded-For is set by Render, HuggingFace Spaces, Vercel, etc.
+    Falls back to direct connection IP.
+    """
+    # X-Forwarded-For may contain a comma-separated list; take the first (originating) IP
+    forwarded_for = req.headers.get("X-Forwarded-For")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+
+    # Fallback for CF/nginx single-header proxies
+    real_ip = req.headers.get("X-Real-IP")
+    if real_ip:
+        return real_ip.strip()
+
+    return req.client.host if req.client else "unknown"
+
+
+def check_rate_limit(client_ip: str) -> bool:
+    """
+    Sliding-window in-memory rate limiter.
+    Periodically purges stale entries to avoid unbounded memory growth.
+    """
+    global _rate_limit_last_cleanup
+    now = time.time()
+    window = 60  # 1-minute window
+
+    # Periodic cleanup of IPs with no recent activity
+    if now - _rate_limit_last_cleanup > _RATE_LIMIT_CLEANUP_INTERVAL:
+        stale = [ip for ip, times in _rate_limit_store.items()
+                 if not any(now - t < window for t in times)]
+        for ip in stale:
+            del _rate_limit_store[ip]
+        _rate_limit_last_cleanup = now
+
+    if client_ip not in _rate_limit_store:
+        _rate_limit_store[client_ip] = []
+
+    # Evict timestamps outside the current window
+    _rate_limit_store[client_ip] = [
+        t for t in _rate_limit_store[client_ip] if now - t < window
+    ]
+
+    if len(_rate_limit_store[client_ip]) >= settings.RATE_LIMIT_PER_MINUTE:
+        return False
+
+    _rate_limit_store[client_ip].append(now)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Lifespan — startup & shutdown
+# ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application startup and shutdown events."""
-    # Startup
     logger.info("Starting Secure Financial Advisory Agent...")
+
+    # 1. Validate config (raises clearly if DATABASE_URL is missing)
+    settings.validate_database_url()
+
+    # 2. Ensure data directories exist
+    settings.ensure_directories()
+
     logger.info(f"LLM Provider: {settings.LLM_PROVIDER}")
     logger.info(f"LLM Model: {settings.LLM_MODEL}")
 
-    # Seed sample data if vector store is empty
+    # 3. Eagerly build agent graph + DB connection pool
+    #    Errors surface here at startup rather than on the first request.
+    logger.info("Initializing agent graph...")
+    initialize_agent()
+
+    # 4. Seed sample RAG data if vector store is empty
     if not financial_retriever.has_documents():
         logger.info("Seeding sample financial data...")
         seed_sample_data()
@@ -50,13 +129,17 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("Vector store already contains documents")
 
+    logger.info("Startup complete.")
     yield
 
     # Shutdown
     logger.info("Shutting down...")
 
 
-# Create FastAPI app
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+
 app = FastAPI(
     title="Secure Financial Advisory Agent",
     description=(
@@ -67,7 +150,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS Middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -75,6 +157,7 @@ app.add_middleware(
         "http://localhost:3000",
         "http://localhost:5173",
         "https://*.vercel.app",
+        "https://*.hf.space",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -82,7 +165,9 @@ app.add_middleware(
 )
 
 
-# --- Request/Response Models ---
+# ---------------------------------------------------------------------------
+# Request / Response models
+# ---------------------------------------------------------------------------
 
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=5000)
@@ -120,29 +205,9 @@ class UploadResponse(BaseModel):
     status: str
 
 
-# --- Rate Limiting ---
-
-def check_rate_limit(client_ip: str) -> bool:
-    """Simple in-memory rate limiter."""
-    now = time.time()
-    window = 60  # 1 minute window
-
-    if client_ip not in _rate_limit_store:
-        _rate_limit_store[client_ip] = []
-
-    # Clean old entries
-    _rate_limit_store[client_ip] = [
-        t for t in _rate_limit_store[client_ip] if now - t < window
-    ]
-
-    if len(_rate_limit_store[client_ip]) >= settings.RATE_LIMIT_PER_MINUTE:
-        return False
-
-    _rate_limit_store[client_ip].append(now)
-    return True
-
-
-# --- API Endpoints ---
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
@@ -160,24 +225,15 @@ async def health_check():
 async def chat(request: ChatRequest, req: Request):
     """
     Main chat endpoint.
-
-    Flow:
-    1. Rate limit check
-    2. Prompt injection detection
-    3. PII detection and anonymization
-    4. Agent processing
-    5. Output sanitization
-    6. Audit logging
+    Flow: rate limit → prompt guard → PII anonymize → agent → sanitize → audit log
     """
     start_time = time.time()
-
-    # Generate session ID if not provided
     session_id = request.session_id or str(uuid.uuid4())
 
-    # Get client IP for rate limiting
-    client_ip = req.client.host if req.client else "unknown"
+    # Proxy-aware client IP
+    client_ip = _get_client_ip(req)
 
-    # 1. Rate limit check
+    # 1. Rate limit
     if not check_rate_limit(client_ip):
         raise HTTPException(
             status_code=429,
@@ -188,7 +244,6 @@ async def chat(request: ChatRequest, req: Request):
     guard_result = prompt_guard.check(request.message)
 
     if not guard_result["safe"]:
-        # Log security event
         for threat in guard_result["threats"]:
             audit_logger.log_security_event(
                 session_id=session_id,
@@ -224,13 +279,12 @@ async def chat(request: ChatRequest, req: Request):
             disclaimer_added=False,
         )
 
-    # 3. PII detection and anonymization on input
+    # 3. PII detection and anonymization
     sanitized_message, pii_detections = pii_detector.anonymize(
         guard_result["sanitized_input"],
         operator="replace",
     )
 
-    # Log PII detections
     for detection in pii_detections:
         audit_logger.log_pii_detection(
             session_id=session_id,
@@ -301,7 +355,6 @@ async def chat(request: ChatRequest, req: Request):
 @app.post("/upload", response_model=UploadResponse)
 async def upload_document(file: UploadFile = File(...)):
     """Upload a financial document for RAG ingestion."""
-    # Validate file type
     allowed_types = {".pdf", ".txt", ".md"}
     file_ext = "." + file.filename.split(".")[-1].lower() if "." in file.filename else ""
 
@@ -311,17 +364,14 @@ async def upload_document(file: UploadFile = File(...)):
             detail=f"File type '{file_ext}' not supported. Allowed: {allowed_types}",
         )
 
-    # Validate file size (max 10MB)
     content = await file.read()
     if len(content) > 10 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="File too large. Max 10MB.")
 
-    # Save file
     save_path = settings.FINANCIAL_REPORTS_DIR / file.filename
     with open(save_path, "wb") as f:
         f.write(content)
 
-    # Ingest into vector store
     try:
         chunks = document_ingestor.ingest_file(str(save_path))
         return UploadResponse(
@@ -339,7 +389,6 @@ async def get_stats():
     audit_stats = audit_logger.get_stats()
     doc_stats = document_ingestor.get_collection_stats()
     security_summary = audit_logger.get_security_summary(24)
-
     return {
         "audit": audit_stats,
         "documents": doc_stats,

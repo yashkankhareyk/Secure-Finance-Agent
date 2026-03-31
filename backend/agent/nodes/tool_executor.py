@@ -1,7 +1,9 @@
 """
-Tool Executor Node - Executes the selected tool based on routing decision.
+Fix 3 — Multi-step tool executor
+Replaces: backend/agent/nodes/tool_executor.py
 """
 
+import re
 import logging
 from agent.state import AgentState
 from agent.tools.rag_tool import search_financial_knowledge
@@ -11,81 +13,71 @@ from agent.tools.compliance_tool import check_compliance
 
 logger = logging.getLogger(__name__)
 
+_COMMON_WORDS = {
+    "I", "A", "AN", "THE", "IS", "IT", "AT", "IN", "ON", "TO", "OF",
+    "OR", "AND", "FOR", "BY", "IF", "DO", "ME", "MY", "NO", "SO", "UP",
+    "AM", "AS", "BE", "HE", "WE", "US", "PE", "EPS", "ROI", "ETF", "IPO", "CEO",
+}
+
+
+def _run_tool(route: str, query: str, tools_used: list) -> str | None:
+    if route == "rag":
+        tools_used.append("rag_search")
+        return search_financial_knowledge.invoke(query)
+
+    elif route == "market":
+        query_lower = query.lower()
+        if any(p in query_lower for p in ["overview", "market today", "how is the market", "indices"]):
+            tools_used.append("market_overview")
+            return get_market_overview.invoke("")
+        tickers = [t for t in re.findall(r'\b([A-Z]{1,5})\b', query) if t not in _COMMON_WORDS]
+        if tickers:
+            results = []
+            for ticker in tickers[:3]:
+                results.append(get_stock_data.invoke(ticker))
+                tools_used.append(f"stock_data:{ticker}")
+            return "\n\n---\n\n".join(results)
+        tools_used.append("market_overview")
+        return get_market_overview.invoke("")
+
+    elif route == "calculator":
+        tools_used.append("calculator")
+        return financial_calculator.invoke(query)
+
+    elif route == "compliance":
+        tools_used.append("compliance_check")
+        return check_compliance.invoke(query)
+
+    return None
+
 
 def execute_tools(state: AgentState) -> AgentState:
-    """Execute the appropriate tool based on the routing decision."""
-    route = state.get("route", "general")
+    """Pop the next route from remaining_routes and execute its tool."""
+    remaining = list(state.get("remaining_routes", [state.get("route", "rag")]))
     query = state.get("current_query", "")
     tools_used = list(state.get("tools_used", []))
+    prior_results: list[dict] = list(state.get("all_tool_results", []))
 
-    tool_result = None
+    if not remaining:
+        return {**state, "remaining_routes": [], "all_tool_results": prior_results}
+
+    current_route = remaining.pop(0)
 
     try:
-        if route == "rag":
-            tool_result = search_financial_knowledge.invoke(query)
-            tools_used.append("rag_search")
-
-        elif route == "market":
-            # Determine if it's a specific stock or market overview
-            query_lower = query.lower()
-
-            if any(phrase in query_lower for phrase in [
-                "overview", "market today", "how is the market",
-                "market doing", "all markets", "indices"
-            ]):
-                tool_result = get_market_overview.invoke("")
-                tools_used.append("market_overview")
-            else:
-                # Extract ticker symbol
-                import re
-                # Look for explicit tickers (uppercase, 1-5 chars)
-                tickers = re.findall(r'\b([A-Z]{1,5})\b', query)
-                # Filter out common English words
-                common_words = {
-                    "I", "A", "AN", "THE", "IS", "IT", "AT", "IN",
-                    "ON", "TO", "OF", "OR", "AND", "FOR", "BY",
-                    "IF", "DO", "ME", "MY", "NO", "SO", "UP",
-                    "AM", "AS", "BE", "HE", "WE", "US",
-                    "PE", "EPS", "ROI", "ETF", "IPO", "CEO",
-                }
-                tickers = [t for t in tickers if t not in common_words]
-
-                if tickers:
-                    results = []
-                    for ticker in tickers[:3]:  # Max 3 tickers
-                        result = get_stock_data.invoke(ticker)
-                        results.append(result)
-                        tools_used.append(f"stock_data:{ticker}")
-                    tool_result = "\n\n---\n\n".join(results)
-                else:
-                    tool_result = get_market_overview.invoke("")
-                    tools_used.append("market_overview")
-
-        elif route == "calculator":
-            tool_result = financial_calculator.invoke(query)
-            tools_used.append("calculator")
-
-        elif route == "compliance":
-            tool_result = check_compliance.invoke(query)
-            tools_used.append("compliance_check")
-
-        else:  # general
-            # For general queries, try RAG first for context
-            rag_result = search_financial_knowledge.invoke(query)
-            if "No relevant information found" not in rag_result:
-                tool_result = rag_result
-                tools_used.append("rag_search")
-            else:
-                tool_result = None
-                tools_used.append("general_knowledge")
-
+        result = _run_tool(current_route, query, tools_used)
     except Exception as e:
-        logger.error(f"Tool execution error ({route}): {e}")
-        tool_result = f"I encountered an issue while processing your request. Let me provide general guidance instead."
-        tools_used.append(f"error:{route}")
+        logger.error(f"Tool execution error ({current_route}): {e}")
+        result = f"[Tool error on {current_route}: {e}]"
+        tools_used.append(f"error:{current_route}")
+
+    if result:
+        prior_results.append({"route": current_route, "result": result})
 
     return {
         **state,
-        "tool_results": {"route": route, "result": tool_result},
+        "route": current_route,
+        "remaining_routes": remaining,
+        "tool_results": {"route": current_route, "result": result},
+        "all_tool_results": prior_results,
         "tools_used": tools_used,
     }

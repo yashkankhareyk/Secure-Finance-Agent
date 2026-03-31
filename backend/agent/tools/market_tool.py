@@ -1,19 +1,92 @@
 """
 Market Data Tool - Fetches real-time stock/market data using yfinance (FREE).
+
+CHANGED:
+- Per-symbol TTL cache (60s for stocks, 5min for indices) avoids hammering Yahoo.
+- Exponential backoff with jitter on transient errors (connection reset, timeout).
+- Request throttling: minimum gap between yfinance calls to avoid rate-limiting.
+- All network errors are caught and return a clean user-facing message.
 """
 
+import time
+import random
 import logging
-from datetime import datetime, timedelta
+from threading import Lock
+from typing import Any
+
 from langchain_core.tools import tool
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Simple in-process TTL cache
+# ---------------------------------------------------------------------------
+
+_cache: dict[str, tuple[float, Any]] = {}  # key -> (expires_at, value)
+_cache_lock = Lock()
+
+_STOCK_TTL = 60          # seconds — individual stock data
+_INDEX_TTL = 300         # seconds — market overview indices
+_MIN_REQUEST_GAP = 0.5   # seconds — minimum time between yfinance calls
+_last_request_time: float = 0.0
+_request_lock = Lock()
+
+
+def _cache_get(key: str) -> Any | None:
+    with _cache_lock:
+        entry = _cache.get(key)
+        if entry and time.time() < entry[0]:
+            return entry[1]
+        return None
+
+
+def _cache_set(key: str, value: Any, ttl: int):
+    with _cache_lock:
+        _cache[key] = (time.time() + ttl, value)
+
+
+def _throttle():
+    """Ensure minimum gap between outbound yfinance requests."""
+    global _last_request_time
+    with _request_lock:
+        gap = time.time() - _last_request_time
+        if gap < _MIN_REQUEST_GAP:
+            time.sleep(_MIN_REQUEST_GAP - gap)
+        _last_request_time = time.time()
+
+
+def _fetch_with_backoff(fn, max_retries: int = 3):
+    """
+    Call fn() with exponential backoff + jitter on transient failures.
+    Retries on ConnectionError, TimeoutError, and OSError (connection reset).
+    """
+    delay = 1.0
+    for attempt in range(max_retries):
+        try:
+            _throttle()
+            return fn()
+        except (ConnectionError, TimeoutError, OSError) as e:
+            if attempt == max_retries - 1:
+                raise
+            sleep_time = delay + random.uniform(0, 0.5)
+            logger.warning(
+                f"yfinance transient error (attempt {attempt + 1}/{max_retries}): "
+                f"{e} — retrying in {sleep_time:.1f}s"
+            )
+            time.sleep(sleep_time)
+            delay *= 2  # exponential backoff
+    return None  # unreachable but satisfies type checkers
+
 
 def _safe_get(info: dict, key: str, default="N/A"):
-    """Safely get a value from dict."""
+    """Safely get a value from dict, treating None as missing."""
     val = info.get(key, default)
     return val if val is not None else default
 
+
+# ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
 
 @tool
 def get_stock_data(symbol: str) -> str:
@@ -29,31 +102,46 @@ def get_stock_data(symbol: str) -> str:
     Args:
         symbol: Stock ticker symbol (e.g., 'AAPL', 'GOOGL', 'MSFT')
     """
+    symbol = symbol.upper().strip()
+    cache_key = f"stock:{symbol}"
+
+    cached = _cache_get(cache_key)
+    if cached:
+        logger.debug(f"Cache hit for {symbol}")
+        return cached
+
     try:
         import yfinance as yf
 
-        ticker = yf.Ticker(symbol.upper().strip())
-        info = ticker.info
+        def _fetch():
+            ticker = yf.Ticker(symbol)
+            return ticker.info
+
+        info = _fetch_with_backoff(_fetch)
 
         if not info or info.get("regularMarketPrice") is None:
-            # Try fast_info as fallback
+            # Fallback to fast_info
             try:
-                fast = ticker.fast_info
-                return (
-                    f"**{symbol.upper()}**\n"
+                def _fetch_fast():
+                    import yfinance as yf
+                    return yf.Ticker(symbol).fast_info
+
+                fast = _fetch_with_backoff(_fetch_fast)
+                result = (
+                    f"**{symbol}**\n"
                     f"- Last Price: ${fast.get('lastPrice', 'N/A')}\n"
                     f"- Market Cap: ${fast.get('marketCap', 'N/A'):,.0f}\n"
                     f"- 52-Week Range: Not available\n"
                     f"\n*Limited data available for this symbol.*"
                 )
+                _cache_set(cache_key, result, _STOCK_TTL)
+                return result
             except Exception:
                 return f"Could not find data for symbol '{symbol}'. Please verify the ticker symbol."
 
-        # Build comprehensive response
         current_price = _safe_get(info, "regularMarketPrice")
         prev_close = _safe_get(info, "previousClose")
 
-        # Calculate change
         change_str = ""
         if isinstance(current_price, (int, float)) and isinstance(prev_close, (int, float)):
             change = current_price - prev_close
@@ -61,7 +149,7 @@ def get_stock_data(symbol: str) -> str:
             direction = "📈" if change >= 0 else "📉"
             change_str = f"{direction} Change: ${change:+.2f} ({change_pct:+.2f}%)"
 
-        result = f"""**{_safe_get(info, 'longName', symbol.upper())}** ({symbol.upper()})
+        result = f"""**{_safe_get(info, 'longName', symbol)}** ({symbol})
 
 **Current Price:** ${current_price}
 {change_str}
@@ -90,8 +178,15 @@ def get_stock_data(symbol: str) -> str:
 **Sector:** {_safe_get(info, 'sector')}
 **Industry:** {_safe_get(info, 'industry')}
 """
+        _cache_set(cache_key, result, _STOCK_TTL)
         return result
 
+    except (ConnectionError, TimeoutError, OSError) as e:
+        logger.error(f"Network error fetching {symbol} after retries: {e}")
+        return (
+            f"Unable to fetch data for '{symbol}' due to a network issue. "
+            "Please try again in a moment."
+        )
     except Exception as e:
         logger.error(f"Market data error for {symbol}: {e}")
         return f"Error fetching data for '{symbol}': {str(e)}. Please check the ticker symbol."
@@ -108,6 +203,12 @@ def get_market_overview() -> str:
     - How the market is doing today
     - Index performance (S&P 500, Dow, Nasdaq)
     """
+    cache_key = "market:overview"
+    cached = _cache_get(cache_key)
+    if cached:
+        logger.debug("Cache hit for market overview")
+        return cached
+
     try:
         import yfinance as yf
 
@@ -123,8 +224,10 @@ def get_market_overview() -> str:
 
         for symbol, name in indices.items():
             try:
-                ticker = yf.Ticker(symbol)
-                hist = ticker.history(period="2d")
+                def _fetch(sym=symbol):
+                    return yf.Ticker(sym).history(period="2d")
+
+                hist = _fetch_with_backoff(_fetch)
 
                 if len(hist) >= 2:
                     current = hist["Close"].iloc[-1]
@@ -132,7 +235,6 @@ def get_market_overview() -> str:
                     change = current - previous
                     change_pct = (change / previous) * 100
                     direction = "🟢" if change >= 0 else "🔴"
-
                     results.append(
                         f"{direction} **{name}**: {current:,.2f} "
                         f"({change_pct:+.2f}%)"
@@ -140,11 +242,19 @@ def get_market_overview() -> str:
                 elif len(hist) == 1:
                     current = hist["Close"].iloc[-1]
                     results.append(f"⚪ **{name}**: {current:,.2f}")
+                else:
+                    results.append(f"⚪ **{name}**: Data unavailable")
+
+            except (ConnectionError, TimeoutError, OSError) as e:
+                results.append(f"⚪ **{name}**: Temporarily unavailable")
+                logger.warning(f"Network error fetching {name}: {e}")
             except Exception as e:
                 results.append(f"⚪ **{name}**: Data unavailable")
                 logger.warning(f"Failed to fetch {name}: {e}")
 
-        return "\n".join(results)
+        result = "\n".join(results)
+        _cache_set(cache_key, result, _INDEX_TTL)
+        return result
 
     except Exception as e:
         logger.error(f"Market overview error: {e}")

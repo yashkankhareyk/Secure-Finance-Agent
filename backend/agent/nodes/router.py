@@ -1,103 +1,91 @@
 """
-Router Node - Determines which tool(s) the agent should use
-based on the user's query.
+Fix 3 — Multi-tool router
+Replaces: backend/agent/nodes/router.py
 """
 
+import re
 import logging
 from agent.state import AgentState
-from langchain_core.messages import SystemMessage
 
 logger = logging.getLogger(__name__)
 
-# Route definitions
-ROUTES = {
-    "rag": {
-        "description": "Search financial knowledge base",
-        "keywords": [
-            "what is", "explain", "how does", "tell me about",
-            "definition", "strategy", "allocation", "retirement",
-            "planning", "diversification", "risk management",
-            "fundamentals", "basics", "guide", "learn",
-            "fiduciary", "regulation", "compliance", "sec",
-            "ira", "401k", "roth", "tax", "bond", "etf",
-        ],
-    },
-    "market": {
-        "description": "Get real-time market/stock data",
-        "keywords": [
-            "stock", "price", "ticker", "market", "nasdaq",
-            "s&p", "dow", "share", "trading", "quote",
-            "performance", "today", "current", "live",
-            "aapl", "googl", "msft", "amzn", "tsla",
-            "index", "indices", "overview", "how is the market",
-        ],
-    },
-    "calculator": {
-        "description": "Perform financial calculations",
-        "keywords": [
-            "calculate", "computation", "how much", "what would",
-            "interest", "compound", "payment", "mortgage", "loan",
-            "return", "cagr", "roi", "yield", "project",
-            "if i invest", "how long", "how many years",
-            "monthly payment", "future value", "present value",
-        ],
-    },
-    "compliance": {
-        "description": "Check regulatory compliance",
-        "keywords": [
-            "compliance", "regulation", "legal", "allowed",
-            "prohibited", "sec rule", "finra", "fiduciary",
-            "suitability", "disclosure", "is it legal",
-            "can i", "rules about", "requirement",
-        ],
-    },
+ROUTE_KEYWORDS = {
+    "market": [
+        "stock", "price", "ticker", "market", "nasdaq", "s&p", "dow",
+        "share", "trading", "quote", "today", "current", "live", "index",
+        "aapl", "googl", "msft", "amzn", "tsla", "how is the market",
+    ],
+    "calculator": [
+        "calculate", "how much", "what would", "interest", "compound",
+        "payment", "mortgage", "loan", "return", "cagr", "roi", "yield",
+        "if i invest", "monthly payment", "future value", "present value",
+    ],
+    "compliance": [
+        "compliance", "regulation", "legal", "allowed", "prohibited",
+        "sec rule", "finra", "fiduciary", "suitability", "disclosure",
+        "is it legal", "can i legally", "rules about",
+    ],
+    "rag": [
+        "what is", "explain", "how does", "tell me about", "definition",
+        "strategy", "allocation", "retirement", "planning", "diversification",
+        "risk management", "fundamentals", "guide", "learn", "ira", "401k",
+        "roth", "tax", "bond", "etf", "should i", "recommend",
+    ],
 }
+
+# Patterns where multiple tools are almost always needed
+MULTI_TOOL_PATTERNS = [
+    (["market", "rag"],       ["price", "what", "why", "explain", "good", "reasonable", "valuation"]),
+    (["calculator", "rag"],   ["calculate", "compound", "loan", "how much", "what is", "explain"]),
+    (["compliance", "rag"],   ["legal", "regulation", "allowed", "what is", "explain"]),
+    (["market", "compliance"],["stock", "trading", "investment", "legal", "allowed"]),
+]
+
+
+def _score_routes(query_lower: str) -> dict[str, int]:
+    return {
+        route: sum(1 for kw in keywords if kw in query_lower)
+        for route, keywords in ROUTE_KEYWORDS.items()
+    }
+
+
+def _has_ticker(query: str) -> bool:
+    return bool(re.search(r'\b[A-Z]{2,5}\b', query))
 
 
 def route_query(state: AgentState) -> AgentState:
-    """
-    Analyze the query and determine which tool to route to.
-    Uses keyword matching for fast, deterministic routing.
-    Falls back to 'general' for conversational queries.
-    """
+    """Build an ordered multi-tool execution plan for this query."""
     query = state.get("current_query", "")
     query_lower = query.lower()
+    scores = _score_routes(query_lower)
 
-    # Score each route
-    scores = {}
-    for route_name, route_info in ROUTES.items():
-        score = sum(1 for kw in route_info["keywords"] if kw in query_lower)
-        scores[route_name] = score
+    ranked = sorted(
+        [(route, score) for route, score in scores.items() if score > 0],
+        key=lambda x: x[1],
+        reverse=True,
+    )
+    primary_routes = [r for r, _ in ranked]
 
-    # Get the highest scoring route
-    if scores:
-        best_route = max(scores, key=scores.get)
-        best_score = scores[best_route]
+    if _has_ticker(query) and "market" not in primary_routes:
+        primary_routes.insert(0, "market")
 
-        if best_score > 0:
-            selected_route = best_route
-        else:
-            selected_route = "general"
-    else:
-        selected_route = "general"
+    # Check multi-tool pattern boosts
+    for combo, trigger_words in MULTI_TOOL_PATTERNS:
+        trigger_hits = sum(1 for w in trigger_words if w in query_lower)
+        if trigger_hits >= 2:
+            merged = list(dict.fromkeys(combo + primary_routes))
+            primary_routes = merged[:3]
+            break
 
-    # Special case: if query mentions a ticker symbol pattern (1-5 uppercase letters)
-    import re
-    if re.search(r'\b[A-Z]{1,5}\b', query) and selected_route == "general":
-        # Could be a stock ticker
-        if any(word in query_lower for word in ["price", "stock", "how is", "what about"]):
-            selected_route = "market"
+    if not primary_routes:
+        primary_routes = ["rag"]
 
-    # Special case: market overview queries
-    if any(phrase in query_lower for phrase in [
-        "market overview", "how is the market", "market today",
-        "market doing", "markets today"
-    ]):
-        selected_route = "market"
+    primary_routes = primary_routes[:3]  # max 3 tools per query
 
-    logger.info(f"Routed query to: {selected_route} (scores: {scores})")
+    logger.info(f"Multi-tool plan: {primary_routes} (scores: {scores})")
 
     return {
         **state,
-        "route": selected_route,
+        "route": primary_routes[0],
+        "remaining_routes": primary_routes,
     }

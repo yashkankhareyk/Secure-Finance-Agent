@@ -1,6 +1,7 @@
 """
-Agent state definition for LangGraph.
-Defines the data structure that flows through the agent graph.
+Fix 3 — Updated AgentState
+Replaces: backend/agent/state.py
+Adds: remaining_routes, all_tool_results
 """
 
 from typing import Annotated, TypedDict, Optional
@@ -11,17 +12,23 @@ from langchain_core.messages import BaseMessage
 class AgentState(TypedDict):
     """State that flows through the LangGraph agent."""
 
-    # Chat messages (LangGraph handles message accumulation)
+    # Chat messages
     messages: Annotated[list[BaseMessage], add_messages]
 
     # Current query (sanitized)
     current_query: str
 
-    # Router decision
-    route: Optional[str]  # "rag", "market", "calculator", "compliance", "general"
+    # Primary route for this invocation (backward compat)
+    route: Optional[str]
 
-    # Tool results
+    # Fix 3: ordered list of remaining tools to call this turn
+    remaining_routes: list[str]
+
+    # Single tool result (backward compat, latest tool only)
     tool_results: Optional[dict]
+
+    # Fix 3: accumulated results from ALL tools called this turn
+    all_tool_results: list[dict]
 
     # Security metadata
     pii_detected: list[dict]

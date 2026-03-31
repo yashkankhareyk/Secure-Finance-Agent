@@ -1,5 +1,6 @@
 # ==============================================
 # Secure Financial Advisory Agent - Dependencies
+# Compatible pinned versions (fixed 2026-03)
 # ==============================================
 
 # --- Core Framework ---
@@ -10,24 +11,27 @@ pydantic==2.10.3
 
 # --- LLM & Agent Framework ---
 langgraph==0.2.60
+langgraph-checkpoint==2.1.2
+langgraph-checkpoint-postgres==2.0.13
+langgraph-checkpoint-sqlite==2.0.6
 langchain==0.3.13
 langchain-core>=0.3.29,<0.4.0
 langchain-openai==0.2.14
 langchain-groq==0.2.3
 
-# --- Vector Store & Embeddings (NEW correct packages) ---
-# These are the official LangChain integration packages
-# They replace the deprecated langchain_community imports
+# --- Vector Store & Embeddings ---
 langchain-huggingface==0.1.2
 langchain-chroma==0.2.2
-chromadb==0.5.23
+chromadb==0.6.3
 sentence-transformers==3.3.1
 
-# --- LangChain Community (only for non-deprecated utilities) ---
+# --- LangChain Community ---
 langchain-community==0.3.13
+langchain-text-splitters==0.3.8
 
-# --- Financial Data (all FREE) ---
+# --- Financial Data ---
 yfinance==0.2.51
+rank-bm25==0.2.2
 
 # --- Privacy & Security ---
 presidio-analyzer==2.2.355
@@ -37,14 +41,17 @@ presidio-anonymizer==2.2.355
 pypdf==5.1.0
 python-multipart==0.0.18
 
-# --- Database (works with SQLite dev + PostgreSQL/Supabase prod) ---
-SQLAlchemy>=2.0.0
+# --- Database ---
+SQLAlchemy>=2.0.0,<3.0.0
 psycopg2-binary>=2.9.6
+psycopg>=3.1.0
+psycopg-pool>=3.1.0
 
 # --- Utilities ---
 pyyaml==6.0.2
-httpx==0.28.1
+httpx==0.27.2
 numpy==1.26.4
+langsmith>=0.1.125,<0.3.0
 
 # --- Testing ---
 pytest==8.3.4
