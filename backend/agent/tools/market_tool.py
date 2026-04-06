@@ -134,7 +134,7 @@ def get_stock_data(symbol: str) -> str:
                     f"- 52-Week Range: Not available\n"
                     f"\n*Limited data available for this symbol.*"
                 )
-                _cache_set(cache_key, result, _STOCK_TTL)
+                _cache_set(cache_key, result, 15)
                 return result
             except Exception:
                 return f"Could not find data for symbol '{symbol}'. Please verify the ticker symbol."
