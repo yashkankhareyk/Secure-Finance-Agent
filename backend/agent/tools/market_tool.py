@@ -194,15 +194,6 @@ def get_stock_data(symbol: str) -> str:
 
 @tool
 def get_market_overview() -> str:
-    """
-    Get an overview of major market indices and their current performance.
-
-    Use this tool when the user asks about:
-    - Overall market performance
-    - Market conditions
-    - How the market is doing today
-    - Index performance (S&P 500, Dow, Nasdaq)
-    """
     cache_key = "market:overview"
     cached = _cache_get(cache_key)
     if cached:
@@ -214,13 +205,14 @@ def get_market_overview() -> str:
 
         indices = {
             "^GSPC": "S&P 500",
-            "^DJI": "Dow Jones",
+            "^DJI":  "Dow Jones",
             "^IXIC": "NASDAQ",
-            "^RUT": "Russell 2000",
-            "^VIX": "VIX (Volatility)",
+            "^RUT":  "Russell 2000",
+            "^VIX":  "VIX (Volatility)",
         }
 
         results = ["## 📊 Market Overview\n"]
+        successful_fetches = 0   # ← track how many succeeded
 
         for symbol, name in indices.items():
             try:
@@ -230,18 +222,19 @@ def get_market_overview() -> str:
                 hist = _fetch_with_backoff(_fetch)
 
                 if len(hist) >= 2:
-                    current = hist["Close"].iloc[-1]
-                    previous = hist["Close"].iloc[-2]
-                    change = current - previous
+                    current    = hist["Close"].iloc[-1]
+                    previous   = hist["Close"].iloc[-2]
+                    change     = current - previous
                     change_pct = (change / previous) * 100
-                    direction = "🟢" if change >= 0 else "🔴"
+                    direction  = "🟢" if change >= 0 else "🔴"
                     results.append(
-                        f"{direction} **{name}**: {current:,.2f} "
-                        f"({change_pct:+.2f}%)"
+                        f"{direction} **{name}**: {current:,.2f} ({change_pct:+.2f}%)"
                     )
+                    successful_fetches += 1   # ← count success
                 elif len(hist) == 1:
                     current = hist["Close"].iloc[-1]
                     results.append(f"⚪ **{name}**: {current:,.2f}")
+                    successful_fetches += 1
                 else:
                     results.append(f"⚪ **{name}**: Data unavailable")
 
@@ -253,7 +246,13 @@ def get_market_overview() -> str:
                 logger.warning(f"Failed to fetch {name}: {e}")
 
         result = "\n".join(results)
-        _cache_set(cache_key, result, _INDEX_TTL)
+
+        # ✅ Only cache if at least some data came back successfully
+        if successful_fetches > 0:
+            _cache_set(cache_key, result, _INDEX_TTL)
+        else:
+            logger.warning("All market fetches failed — not caching empty result")
+
         return result
 
     except Exception as e:
